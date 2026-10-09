@@ -1,0 +1,25 @@
+# ByteVault - Automated Data & File Backup System
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments & virtualenvs
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files & backup outputs
+*.tmp
+*.bak
+*.swp
+backups/
+test_output/

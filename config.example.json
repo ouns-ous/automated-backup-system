@@ -1,0 +1,22 @@
+{
+  "task_name": "daily_backup",
+  "source_dirs": [
+    "./sample_data"
+  ],
+  "backup_dest": "./backups",
+  "compression": "zip",
+  "incremental": true,
+  "retention_count": 5,
+  "retention_days": 14,
+  "exclude_patterns": [
+    "*.tmp",
+    "*.log",
+    "__pycache__/*",
+    "*/__pycache__/*",
+    ".git/*",
+    "*/.git/*",
+    "*.swp",
+    "Thumbs.db",
+    ".DS_Store"
+  ]
+}
