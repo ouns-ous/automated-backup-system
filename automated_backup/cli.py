@@ -1,6 +1,7 @@
 """
 ByteVault Command Line Interface (CLI)
-Provides command-line entry points for all backup, verification, restoration, and pruning tasks.
+Provides command-line entry points for all backup, verification, restoration,
+pruning, real-time watching, snapshot inspection, diffing, and dashboard generation.
 """
 
 import argparse
@@ -11,7 +12,9 @@ from typing import Optional
 
 from automated_backup import __version__
 from automated_backup.config import BackupConfig, create_default_config, load_config
+from automated_backup.dashboard import DashboardGenerator
 from automated_backup.engine import BackupEngine
+from automated_backup.inspector import SnapshotInspector
 from automated_backup.reporter import (
     format_bytes,
     print_backup_summary,
@@ -19,6 +22,7 @@ from automated_backup.reporter import (
 )
 from automated_backup.restore import RestoreEngine
 from automated_backup.retention import RetentionManager
+from automated_backup.watcher import BackupWatcher
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -41,7 +45,6 @@ def resolve_config(config_path_str: Optional[str]) -> BackupConfig:
         if p.is_file():
             return load_config(p)
 
-    # Return default config in-memory if no file exists
     return BackupConfig()
 
 
@@ -93,6 +96,32 @@ def main(argv=None) -> int:
     prune_parser.add_argument("--days", type=int, help="Max age in days to retain")
     prune_parser.add_argument("--dry-run", action="store_true", help="Simulate pruning without deleting files")
 
+    # Command: watch
+    watch_parser = subparsers.add_parser("watch", help="Monitor sources and automatically back up on file changes")
+    watch_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    watch_parser.add_argument("--interval", type=float, default=2.0, help="Poll interval in seconds")
+    watch_parser.add_argument("--debounce", type=float, default=3.0, help="Debounce delay in seconds")
+    watch_parser.add_argument("--cycles", type=int, help="Limit number of backup cycles before exiting")
+
+    # Command: inspect
+    inspect_parser = subparsers.add_parser("inspect", help="Inspect detailed file tree of a snapshot")
+    inspect_parser.add_argument("-s", "--snapshot", default="latest", help="Snapshot ID or 'latest'")
+    inspect_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    inspect_parser.add_argument("--dest", help="Override backup destination directory")
+
+    # Command: diff
+    diff_parser = subparsers.add_parser("diff", help="Diff two snapshots or diff live sources against a snapshot")
+    diff_parser.add_argument("-s1", "--snap1", help="Base snapshot ID")
+    diff_parser.add_argument("-s2", "--snap2", help="Target snapshot ID (optional if --live is used)")
+    diff_parser.add_argument("--live", action="store_true", help="Diff current live source files against snapshot")
+    diff_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+
+    # Command: report
+    report_parser = subparsers.add_parser("report", help="Generate an HTML dashboard or Markdown report")
+    report_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    report_parser.add_argument("-o", "--output", default="backup_report.html", help="Output file path")
+    report_parser.add_argument("-f", "--format", choices=["html", "markdown"], default="html", help="Report format")
+
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
 
@@ -106,7 +135,6 @@ def main(argv=None) -> int:
         print(f"Created default configuration at: {out_path.resolve()}")
         return 0
 
-    # For other commands, load config
     config = resolve_config(getattr(args, "config", None))
     if hasattr(args, "dest") and args.dest:
         config.backup_dest = args.dest
@@ -118,7 +146,6 @@ def main(argv=None) -> int:
         result = engine.run_backup(force_full=args.full, dry_run=args.dry_run)
         print_backup_summary(result)
 
-        # Trigger auto-retention if not dry run
         if not args.dry_run:
             retention = RetentionManager(config)
             prune_res = retention.prune_snapshots()
@@ -199,6 +226,64 @@ def main(argv=None) -> int:
         )
         if res["pruned_snapshots"]:
             print(f"Pruned snapshots: {', '.join(res['pruned_snapshots'])}")
+        return 0
+
+    elif args.command == "watch":
+        watcher = BackupWatcher(config, debounce_seconds=args.debounce)
+        print(f"ByteVault Watcher active. Monitoring {config.source_dirs}...")
+        print(f"Press Ctrl+C to stop.")
+        cycles = watcher.run_polling_loop(
+            poll_interval=args.interval,
+            max_cycles=args.cycles,
+            on_backup_callback=lambda res: print(
+                f"[{datetime.now().strftime('%H:%M:%S')}] Automated backup created: "
+                f"{res.get('snapshot_id')} ({res.get('type')}) - "
+                f"+{res.get('changes_summary', {}).get('added', 0)} added, "
+                f"~{res.get('changes_summary', {}).get('modified', 0)} mod"
+            )
+        )
+        print(f"Watcher exited after {cycles} backup cycle(s).")
+        return 0
+
+    elif args.command == "inspect":
+        inspector = SnapshotInspector(config)
+        data = inspector.inspect_snapshot(args.snapshot)
+        print(f"\n=== Snapshot Inspection: {data['snapshot_id']} ===")
+        print(f"Created: {data['timestamp']} | Type: {data['type'].upper()}")
+        print(f"Archive: {data['archive_name']} ({format_bytes(data['archive_size_bytes'])})")
+        print(f"Total Files: {data['files_count']} ({format_bytes(data['total_uncompressed_bytes'])})\n")
+        print(f"{'File Path':<40} {'Size':<10} {'Origin Snapshot'}")
+        print("-" * 75)
+        for f in data["files"]:
+            print(f"{f['path']:<40} {format_bytes(f['size']):<10} {f['origin_snapshot']}")
+        print()
+        return 0
+
+    elif args.command == "diff":
+        inspector = SnapshotInspector(config)
+        if args.live:
+            base = args.snap1 or "latest"
+            res = inspector.diff_live(base)
+            print(f"\n=== Live Diff vs Snapshot: {res['compared_against_snapshot']} ===")
+            print(f"Pending backup size: {format_bytes(res['pending_backup_bytes'])}")
+        else:
+            if not args.snap1 or not args.snap2:
+                print("Error: Specify both -s1 and -s2, or use --live to compare against current files.")
+                return 1
+            res = inspector.diff_snapshots(args.snap1, args.snap2)
+            print(f"\n=== Snapshot Diff: {res['base_snapshot']} -> {res['target_snapshot']} ===")
+            print(f"Net size delta: {format_bytes(res['size_delta_bytes'])}")
+
+        print(f"Added:    {len(res['added'])} {res['added'][:5] if res['added'] else ''}")
+        print(f"Modified: {len(res['modified'])} {res['modified'][:5] if res['modified'] else ''}")
+        print(f"Deleted:  {len(res['deleted'])} {res['deleted'][:5] if res['deleted'] else ''}")
+        print(f"Unchanged count: {res['unchanged_count']}\n")
+        return 0
+
+    elif args.command == "report":
+        gen = DashboardGenerator(config)
+        out = gen.export(Path(args.output), fmt=args.format)
+        print(f"Dashboard report successfully exported to: {out}")
         return 0
 
     return 0
