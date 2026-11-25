@@ -101,13 +101,28 @@ class RetentionManager:
             if should_prune:
                 candidates_to_prune.append(s)
 
-        # Ensure we never prune the base of an active incremental snapshot that is retained
+        # Ensure we never prune any base or origin snapshot referenced by a retained snapshot
         retained_snapshots = [s for s in all_snapshots if s not in candidates_to_prune]
+        snap_by_id = {s["snapshot_id"]: s for s in all_snapshots}
         needed_bases: Set[str] = set()
-        for rs in retained_snapshots:
-            base = rs.get("base_snapshot_id")
+        queue: List[Dict[str, Any]] = list(retained_snapshots)
+
+        while queue:
+            current = queue.pop()
+            refs: Set[str] = set()
+            base = current.get("base_snapshot_id")
             if base:
-                needed_bases.add(base)
+                refs.add(base)
+            for meta in current.get("full_state", {}).values():
+                origin = meta.get("snapshot_id")
+                if origin and origin != current.get("snapshot_id"):
+                    refs.add(origin)
+
+            for ref_id in refs:
+                if ref_id not in needed_bases:
+                    needed_bases.add(ref_id)
+                    if ref_id in snap_by_id:
+                        queue.append(snap_by_id[ref_id])
 
         final_prune_list: List[Dict[str, Any]] = []
         for candidate in candidates_to_prune:

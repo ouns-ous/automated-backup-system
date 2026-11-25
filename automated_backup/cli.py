@@ -5,6 +5,8 @@ pruning, real-time watching, snapshot inspection, diffing, and dashboard generat
 """
 
 import argparse
+from datetime import datetime
+import json
 import logging
 from pathlib import Path
 import sys
@@ -13,7 +15,9 @@ from typing import Optional
 from automated_backup import __version__
 from automated_backup.config import BackupConfig, create_default_config, load_config
 from automated_backup.dashboard import DashboardGenerator
+from automated_backup.doctor import BackupDoctor
 from automated_backup.engine import BackupEngine
+from automated_backup.history import FileHistoryEngine
 from automated_backup.inspector import SnapshotInspector
 from automated_backup.reporter import (
     format_bytes,
@@ -88,6 +92,10 @@ def main(argv=None) -> int:
     restore_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
     restore_parser.add_argument("--dest", help="Override backup destination directory")
     restore_parser.add_argument("--no-verify", action="store_true", help="Skip checksum verification")
+    restore_parser.add_argument("--include", action="append", help="Glob pattern of files to include (repeatable)")
+    restore_parser.add_argument("--exclude", action="append", help="Glob pattern of files to exclude (repeatable)")
+    restore_parser.add_argument("--skip-existing", action="store_true", help="Do not overwrite files already in target")
+    restore_parser.add_argument("--dry-run", action="store_true", help="Preview restore plan without writing files")
 
     # Command: prune
     prune_parser = subparsers.add_parser("prune", help="Clean older snapshots according to retention policy")
@@ -121,6 +129,27 @@ def main(argv=None) -> int:
     report_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
     report_parser.add_argument("-o", "--output", default="backup_report.html", help="Output file path")
     report_parser.add_argument("-f", "--format", choices=["html", "markdown"], default="html", help="Report format")
+
+    # Command: history
+    history_parser = subparsers.add_parser("history", help="Inspect file revision history across snapshots or restore a single file version")
+    history_parser.add_argument("pattern", help="File path or glob pattern (e.g. 'data.txt' or '*.py')")
+    history_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    history_parser.add_argument("--dest", help="Override backup destination directory")
+    history_parser.add_argument("--changes-only", action="store_true", help="Hide UNCHANGED snapshot entries")
+    history_parser.add_argument("--restore-snapshot", help="Restore the specified file from this snapshot ID")
+    history_parser.add_argument("-t", "--target", help="Target directory when using --restore-snapshot")
+
+    # Command: dedupe
+    dedupe_parser = subparsers.add_parser("dedupe", help="Analyze duplicate files and storage waste in a snapshot")
+    dedupe_parser.add_argument("-s", "--snapshot", default="latest", help="Snapshot ID or 'latest'")
+    dedupe_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    dedupe_parser.add_argument("--dest", help="Override backup destination directory")
+
+    # Command: doctor
+    doctor_parser = subparsers.add_parser("doctor", help="Audit vault health, archive checksums, incremental chains, and orphans")
+    doctor_parser.add_argument("-c", "--config", help="Path to JSON configuration file")
+    doctor_parser.add_argument("--dest", help="Override backup destination directory")
+    doctor_parser.add_argument("--json", action="store_true", help="Output diagnostics report as JSON")
 
     args = parser.parse_args(argv)
     setup_logging(args.verbose)
@@ -198,12 +227,25 @@ def main(argv=None) -> int:
         result = restore_engine.restore(
             snapshot_id=target_id,
             target_dir=target_dir,
-            verify_checksums=not args.no_verify
+            verify_checksums=not args.no_verify,
+            include_patterns=args.include,
+            exclude_patterns=args.exclude,
+            overwrite=not args.skip_existing,
+            dry_run=args.dry_run,
         )
 
-        if result.get("status") == "success":
+        if result.get("status") == "dry_run":
+            print(f"[DRY RUN] Restore plan for snapshot {target_id} -> {target_dir}")
+            print(f"  Planned files:  {result['restored_files_count']} ({format_bytes(result['total_bytes'])})")
+            print(f"  Skipped files:  {result['skipped_count']}")
+            for pf in result.get("planned_files", [])[:20]:
+                print(f"    + {pf}")
+            return 0
+        elif result.get("status") == "success":
             print(f"Successfully restored snapshot {target_id} to {target_dir}")
             print(f"  Files restored: {result['restored_files_count']}")
+            if result.get("skipped_count"):
+                print(f"  Files skipped:  {result['skipped_count']}")
             print(f"  Total size:     {format_bytes(result['total_bytes'])}")
             print(f"  Integrity:      {'VERIFIED' if result['verified'] else 'SKIPPED'}")
             return 0
@@ -285,6 +327,71 @@ def main(argv=None) -> int:
         out = gen.export(Path(args.output), fmt=args.format)
         print(f"Dashboard report successfully exported to: {out}")
         return 0
+
+    elif args.command == "history":
+        history_engine = FileHistoryEngine(config)
+        if args.restore_snapshot:
+            if not args.target:
+                print("Error: --target is required when using --restore-snapshot.")
+                return 1
+            res = history_engine.restore_file_version(
+                file_path=args.pattern,
+                snapshot_id=args.restore_snapshot,
+                target_dir=Path(args.target),
+            )
+            print(
+                f"Restored '{args.pattern}' from {res['snapshot_id']} to {res['target_dir']} "
+                f"({format_bytes(res['total_bytes'])}, verified={res['verified']})"
+            )
+            return 0 if res.get("status") == "success" else 1
+
+        hist = history_engine.get_file_history(args.pattern, changes_only=args.changes_only)
+        print(f"\n=== File History: '{hist['pattern']}' ({hist['matched_files_count']} file(s) across {hist['snapshots_scanned']} snapshot(s)) ===")
+        if not hist["files"]:
+            print("No matching files found in snapshot history.\n")
+            return 0
+        for path, timeline in hist["files"].items():
+            print(f"\nFile: {path}")
+            for entry in timeline:
+                sha_short = (entry["sha256"] or "-")[:12]
+                ts = (entry["timestamp"] or "N/A")[:19].replace("T", " ")
+                print(
+                    f"  [{entry['status']:<9}] {ts} | {entry['snapshot_id']} | "
+                    f"{format_bytes(entry['size']):<10} | sha256:{sha_short}"
+                )
+        print()
+        return 0
+
+    elif args.command == "dedupe":
+        history_engine = FileHistoryEngine(config)
+        res = history_engine.find_duplicate_files(snapshot_id=args.snapshot)
+        print(f"\n=== Duplicate Analysis: {res['snapshot_id']} ===")
+        print(f"Total Files Scanned:   {res['total_files']}")
+        print(f"Duplicate Groups:      {res['duplicate_groups_count']}")
+        print(f"Total Duplicate Files: {res['total_duplicate_files']}")
+        print(f"Reclaimable Waste:     {format_bytes(res['wasted_bytes'])}\n")
+        for group in res["groups"]:
+            print(f"  SHA-256 {group['sha256'][:16]}... ({format_bytes(group['size'])} x {group['count']}):")
+            for p in group["paths"]:
+                print(f"    - {p}")
+        return 0
+
+    elif args.command == "doctor":
+        doc = BackupDoctor(config)
+        diag = doc.run_diagnostics()
+        if args.json:
+            print(json.dumps(diag, indent=2))
+        else:
+            print(f"\n=== ByteVault Doctor Report: {diag['task_name']} ===")
+            print(f"Health Status:      {diag['health_status']}")
+            print(f"Snapshots Checked:  {diag['valid_snapshots']} / {diag['total_snapshots']} valid")
+            print(f"Corrupt Snapshots:  {len(diag['corrupt_snapshots'])}")
+            print(f"Broken Chains:      {len(diag['broken_chains'])}")
+            print(f"Orphaned Archives:  {len(diag['orphaned_archives'])}")
+            print(f"Orphaned Manifests: {len(diag['orphaned_manifests'])}")
+            dup = diag["duplicate_summary"]
+            print(f"Duplicate Waste:    {format_bytes(dup['wasted_bytes'])} ({dup['duplicate_groups_count']} group(s))\n")
+        return 0 if diag["health_status"] != "CRITICAL" else 1
 
     return 0
 

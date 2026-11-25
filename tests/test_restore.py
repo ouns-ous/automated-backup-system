@@ -101,6 +101,46 @@ class TestRestoreEngine(unittest.TestCase):
         # file3 has new content
         self.assertEqual((restore_target / "file3.txt").read_text(encoding="utf-8"), "new file 3")
 
+    def test_selective_restore_dry_run_and_skip_existing(self):
+        (self.source_dir / "keep.py").write_text("print('keep')", encoding="utf-8")
+        (self.source_dir / "ignore.log").write_text("log data", encoding="utf-8")
+        (self.source_dir / "notes.md").write_text("# Notes", encoding="utf-8")
+
+        engine = BackupEngine(self.config)
+        snap = engine.run_backup(force_full=True)
+        restore_engine = RestoreEngine(self.backup_dir)
+
+        # Dry run with include/exclude
+        dry = restore_engine.restore(
+            snapshot_id=snap["snapshot_id"],
+            target_dir=self.restore_dir,
+            include_patterns=["*.py", "*.md"],
+            exclude_patterns=["*.md"],
+            dry_run=True,
+        )
+        self.assertEqual(dry["status"], "dry_run")
+        self.assertEqual(dry["planned_files"], ["keep.py"])
+        self.assertFalse((self.restore_dir / "keep.py").exists())
+
+        # Pre-populate keep.py and restore with overwrite=False
+        (self.restore_dir / "keep.py").write_text("existing custom", encoding="utf-8")
+        res = restore_engine.restore(
+            snapshot_id=snap["snapshot_id"],
+            target_dir=self.restore_dir,
+            include_patterns=["*.py", "*.md"],
+            overwrite=False,
+        )
+        self.assertEqual(res["status"], "success")
+        self.assertEqual(res["skipped_count"], 1)
+        self.assertEqual(res["restored_files_count"], 1)
+        self.assertEqual((self.restore_dir / "keep.py").read_text(encoding="utf-8"), "existing custom")
+        self.assertEqual((self.restore_dir / "notes.md").read_text(encoding="utf-8"), "# Notes")
+        self.assertFalse((self.restore_dir / "ignore.log").exists())
+
+    def test_safe_target_path_blocks_traversal(self):
+        with self.assertRaises(ValueError):
+            RestoreEngine._safe_target_path(self.restore_dir.resolve(), "../outside.txt")
+
 
 if __name__ == "__main__":
     unittest.main()

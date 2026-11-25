@@ -81,6 +81,31 @@ class TestRetentionManager(unittest.TestCase):
         all_snaps = retention.get_snapshots()
         self.assertEqual(len(all_snaps), 3)
 
+    def test_transitive_incremental_chain_protection(self):
+        # Create full -> inc1 -> inc2 where base.txt stays unchanged from full
+        (self.source_dir / "base.txt").write_text("immutable base", encoding="utf-8")
+        engine = BackupEngine(self.config)
+
+        snap_full = engine.run_backup(force_full=True)
+        time.sleep(1.05)
+
+        (self.source_dir / "data.txt").write_text("v1", encoding="utf-8")
+        snap_inc1 = engine.run_backup()
+        time.sleep(1.05)
+
+        (self.source_dir / "data.txt").write_text("v2", encoding="utf-8")
+        snap_inc2 = engine.run_backup()
+
+        retention = RetentionManager(self.config)
+        # Keep only 1 most recent snapshot (inc2); full must STILL be protected transitively
+        prune_res = retention.prune_snapshots(retention_count=1)
+        remaining_ids = {s["snapshot_id"] for s in retention.get_snapshots()}
+
+        self.assertIn(snap_inc2["snapshot_id"], remaining_ids)
+        self.assertIn(snap_full["snapshot_id"], remaining_ids)
+        self.assertIn(snap_inc1["snapshot_id"], remaining_ids)
+        self.assertEqual(prune_res["pruned_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

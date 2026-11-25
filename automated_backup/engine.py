@@ -5,6 +5,7 @@ and snapshot manifest generation.
 """
 
 from datetime import datetime
+import hashlib
 import json
 import logging
 import os
@@ -309,9 +310,11 @@ class BackupEngine:
                     "error": f"Archive hash mismatch! Recorded: {recorded_hash}, Actual: {actual_hash}"
                 }
 
-        # Test archive integrity
-        compression = manifest_data.get("compression", "zip")
-        corrupt_files = []
+        # Test archive integrity across all supported formats
+        compression = manifest_data.get("compression", "zip").lower()
+        included_files = manifest_data.get("included_files", {})
+        corrupt_files: List[str] = []
+        missing_files: List[str] = []
 
         if compression == "zip" and archive_path.is_file():
             try:
@@ -322,18 +325,61 @@ class BackupEngine:
                             "valid": False,
                             "error": f"Corrupt file in zip archive: {bad_file}"
                         }
-                    # Also verify file SHA-256 for each included file
-                    for item in manifest_data.get("included_files", {}).values():
-                        rel = item["rel_path"]
+                    names = set(zf.namelist())
+                    for rel_key, item in included_files.items():
+                        arc_name = rel_key if rel_key in names else item.get("rel_path", rel_key)
                         expected_hash = item.get("sha256")
-                        if expected_hash and rel in zf.namelist():
-                            data = zf.read(rel)
-                            import hashlib
-                            computed = hashlib.sha256(data).hexdigest()
+                        if arc_name not in names:
+                            missing_files.append(rel_key)
+                        elif expected_hash:
+                            with zf.open(arc_name) as member_file:
+                                computed = self._hash_stream(member_file)
                             if computed != expected_hash:
-                                corrupt_files.append(rel)
+                                corrupt_files.append(rel_key)
             except Exception as e:
                 return {"valid": False, "error": f"Failed reading zip archive: {e}"}
+
+        elif compression in ("tar.gz", "tar") and archive_path.is_file():
+            mode = "r:gz" if compression == "tar.gz" else "r"
+            try:
+                with tarfile.open(archive_path, mode=mode) as tf:
+                    members_by_name = {m.name: m for m in tf.getmembers() if m.isfile()}
+                    for rel_key, item in included_files.items():
+                        arc_name = rel_key if rel_key in members_by_name else item.get("rel_path", rel_key)
+                        expected_hash = item.get("sha256")
+                        if arc_name not in members_by_name:
+                            missing_files.append(rel_key)
+                        elif expected_hash:
+                            extracted = tf.extractfile(members_by_name[arc_name])
+                            if extracted is None:
+                                missing_files.append(rel_key)
+                            else:
+                                with extracted:
+                                    computed = self._hash_stream(extracted)
+                                if computed != expected_hash:
+                                    corrupt_files.append(rel_key)
+            except Exception as e:
+                return {"valid": False, "error": f"Failed reading tar archive: {e}"}
+
+        elif compression == "none" and archive_path.is_dir():
+            for rel_key, item in included_files.items():
+                target_file = archive_path / rel_key
+                if not target_file.is_file():
+                    target_file = archive_path / item.get("rel_path", rel_key)
+                if not target_file.is_file():
+                    missing_files.append(rel_key)
+                    continue
+                expected_hash = item.get("sha256")
+                if expected_hash:
+                    computed = calculate_file_hash(target_file)
+                    if computed != expected_hash:
+                        corrupt_files.append(rel_key)
+
+        if missing_files:
+            return {
+                "valid": False,
+                "error": f"Missing files in archive: {missing_files}"
+            }
 
         if corrupt_files:
             return {
@@ -349,3 +395,14 @@ class BackupEngine:
             "archive_sha256": manifest_data.get("archive_sha256"),
             "verified_at": datetime.now().isoformat(),
         }
+
+    @staticmethod
+    def _hash_stream(stream: Any, chunk_size: int = 65536) -> str:
+        """Compute SHA-256 hex digest from a binary stream."""
+        hasher = hashlib.sha256()
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+        return hasher.hexdigest()

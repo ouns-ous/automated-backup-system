@@ -99,6 +99,29 @@ class TestBackupEngine(unittest.TestCase):
         self.assertEqual(len(archives), 0)
         self.assertEqual(len(manifests), 0)
 
+    def test_verify_targz_and_mirror_and_corruption_detection(self):
+        for comp in ("tar.gz", "none"):
+            sub_backup = self.base_path / f"backups_{comp.replace('.', '_')}"
+            cfg = BackupConfig(
+                task_name=f"job_{comp.replace('.', '_')}",
+                source_dirs=[str(self.source_dir)],
+                backup_dest=str(sub_backup),
+                compression=comp,
+                incremental=False,
+            )
+            engine = BackupEngine(cfg)
+            res = engine.run_backup(force_full=True)
+            v_ok = engine.verify_snapshot(res["snapshot_id"])
+            self.assertTrue(v_ok["valid"], f"Expected valid verification for {comp}: {v_ok}")
+
+            if comp == "none":
+                # Corrupt one mirrored file
+                mirrored_file = sub_backup / res["archive_name"] / "file1.txt"
+                mirrored_file.write_text("CORRUPTED", encoding="utf-8")
+                v_bad = engine.verify_snapshot(res["snapshot_id"])
+                self.assertFalse(v_bad["valid"])
+                self.assertIn("Hash mismatch", v_bad["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
